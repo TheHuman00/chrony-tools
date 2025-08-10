@@ -1,0 +1,481 @@
+#!/bin/bash
+
+# ntpcheck - Check NTP server availability and health
+# Part of NTP Tools suite using Chrony
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+# Source the common library
+if [ -f "$LIB_DIR/ntp_common.sh" ]; then
+    source "$LIB_DIR/ntp_common.sh"
+else
+    echo "Error: Cannot find ntp_common.sh library" >&2
+    exit 1
+fi
+
+# Default values
+TIMEOUT=10
+VERBOSE=false
+SERVERS=()
+CHECK_ALL=false
+CHECK_NTS=false
+POOL_SERVERS=("0.pool.ntp.org" "1.pool.ntp.org" "2.pool.ntp.org" "3.pool.ntp.org")
+PUBLIC_SERVERS=("time.google.com" "time.cloudflare.com" "pool.ntp.org" "time.nist.gov")
+
+# Function to show help
+show_help() {
+    show_usage "ntpcheck" "Check NTP server availability and health"
+    echo "Additional Options:"
+    echo "  -a, --all          Check common public NTP servers"
+    echo "  -p, --pool         Check NTP pool servers (0-3.pool.ntp.org)"
+    echo "  -l, --list         List and check configured chrony sources"
+    echo "  -f, --file FILE    Read server list from file"
+    echo "  --nts              Check Network Time Security (NTS) support"
+    echo
+    echo "Examples:"
+    echo "  ntpcheck pool.ntp.org"
+    echo "  ntpcheck -a"
+    echo "  ntpcheck -p"
+    echo "  ntpcheck --nts time.cloudflare.com"
+    echo "  ntpcheck server1.com server2.com server3.com"
+}
+
+# Function to perform basic connectivity test
+test_connectivity() {
+    local server="$1"
+    local results=()
+    
+    # DNS resolution test
+    if host "$server" >/dev/null 2>&1; then
+        results+=("DNS:OK")
+    else
+        results+=("DNS:FAIL")
+    fi
+    
+    # Ping test
+    if timeout 5 ping -c 1 -W 1 "$server" >/dev/null 2>&1; then
+        results+=("PING:OK")
+    else
+        results+=("PING:FAIL")
+    fi
+    
+    # NTP port test
+    if timeout 5 nc -u -z "$server" 123 2>/dev/null; then
+        results+=("NTP_PORT:OK")
+    else
+        results+=("NTP_PORT:FAIL")
+    fi
+    
+    echo "${results[@]}"
+}
+
+# Function to test NTS (Network Time Security) support
+test_nts_support() {
+    local server="$1"
+    local nts_port="${2:-4460}"  # Default NTS-KE port
+    
+    # Test 1: Check if NTS-KE port (4460) is open
+    if ! command -v nc >/dev/null 2>&1; then
+        echo "NTS:NO_NC_TOOL"
+        return 1
+    fi
+    
+    # Test NTS-KE port connectivity
+    if timeout 5 nc -z "$server" "$nts_port" 2>/dev/null; then
+        echo "NTS:KE_PORT_OK"
+    else
+        echo "NTS:KE_PORT_FAIL"
+        return 1
+    fi
+    
+    # Test 2: Try to establish TLS connection to NTS-KE port
+    if command -v openssl >/dev/null 2>&1; then
+        # More lenient TLS test - just check if we can connect
+        local tls_result
+        tls_result=$(timeout 10 openssl s_client -connect "$server:$nts_port" -servername "$server" < /dev/null 2>&1)
+        
+        if echo "$tls_result" | grep -q "CONNECTED\|SSL handshake has read" 2>/dev/null; then
+            echo "NTS:TLS_HANDSHAKE_OK"
+        elif echo "$tls_result" | grep -q "Certificate chain" 2>/dev/null; then
+            echo "NTS:TLS_CERT_OK"
+        else
+            echo "NTS:TLS_HANDSHAKE_FAIL"
+        fi
+    else
+        echo "NTS:NO_OPENSSL_TOOL"
+    fi
+    
+    # Test 3: Check if chrony has NTS support
+    if command -v chronyc >/dev/null 2>&1; then
+        # Check chrony version and NTS support
+        local chrony_version
+        chrony_version=$(chronyc -v 2>/dev/null | head -1)
+        if [ -n "$chrony_version" ]; then
+            echo "NTS:CHRONY_AVAILABLE"
+            # NTS was added in chrony 4.0+
+            local version_num
+            version_num=$(echo "$chrony_version" | grep -o '[0-9]\+\.[0-9]\+' | head -1)
+            if [ -n "$version_num" ]; then
+                local major_ver
+                major_ver=$(echo "$version_num" | cut -d. -f1)
+                if [ "$major_ver" -ge 4 ] 2>/dev/null; then
+                    echo "NTS:CHRONY_NTS_CAPABLE"
+                else
+                    echo "NTS:CHRONY_OLD_VERSION"
+                fi
+            fi
+        else
+            echo "NTS:CHRONY_VERSION_UNKNOWN"
+        fi
+    else
+        echo "NTS:NO_CHRONY_TOOL"
+    fi
+    
+    return 0
+}
+
+# Function to test NTP response
+test_ntp_response() {
+    local server="$1"
+    local method_used="NONE"
+    local success=false
+    
+    # Try ntpdate
+    if command -v ntpdate >/dev/null 2>&1; then
+        if timeout "$TIMEOUT" ntpdate -q "$server" >/dev/null 2>&1; then
+            method_used="NTPDATE"
+            success=true
+        fi
+    fi
+    
+    # Try sntp if ntpdate failed
+    if [ "$success" = false ] && command -v sntp >/dev/null 2>&1; then
+        if timeout "$TIMEOUT" sntp -K /dev/null "$server" >/dev/null 2>&1; then
+            method_used="SNTP"
+            success=true
+        fi
+    fi
+    
+    # Try manual NTP packet if others failed
+    if [ "$success" = false ] && command -v nc >/dev/null 2>&1; then
+        # Create a basic NTP request packet (48 bytes, all zeros except first byte = 0x1b)
+        local ntp_packet
+        ntp_packet=$(perl -e 'print "\x1b" . "\x00" x 47' 2>/dev/null || echo -ne '\x1b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+        
+        if echo -n "$ntp_packet" | timeout 5 nc -u "$server" 123 >/dev/null 2>&1; then
+            method_used="MANUAL"
+            success=true
+        fi
+    fi
+    
+    if [ "$success" = true ]; then
+        echo "NTP_RESPONSE:OK:$method_used"
+    else
+        echo "NTP_RESPONSE:FAIL:$method_used"
+    fi
+}
+
+# Function to get response time
+get_response_time() {
+    local server="$1"
+    
+    if command -v ntpdate >/dev/null 2>&1; then
+        local ntpdate_output
+        ntpdate_output=$(timeout "$TIMEOUT" ntpdate -q "$server" 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$ntpdate_output" ]; then
+            local delay
+            delay=$(echo "$ntpdate_output" | grep "delay" | tail -1 | sed -n 's/.*delay \([0-9.-]*\).*/\1/p')
+            
+            if [ -n "$delay" ]; then
+                echo "$delay"
+                return 0
+            fi
+        fi
+    fi
+    
+    # Fallback to ping time
+    local ping_time
+    ping_time=$(timeout 5 ping -c 1 -W 1 "$server" 2>/dev/null | grep "time=" | sed -n 's/.*time=\([0-9.]*\).*/\1/p')
+    
+    if [ -n "$ping_time" ]; then
+        echo "${ping_time}ms"
+    else
+        echo "N/A"
+    fi
+}
+
+# Function to perform comprehensive server check
+check_server() {
+    local server="$1"
+    local start_time
+    start_time=$(date +%s.%N)
+    
+    echo -e "${BLUE}Checking server: $server${NC}"
+    
+    # Basic connectivity tests
+    local connectivity_results
+    connectivity_results=$(test_connectivity "$server")
+    
+    # NTP response test
+    local ntp_result
+    ntp_result=$(test_ntp_response "$server")
+    
+    # Response time
+    local response_time
+    response_time=$(get_response_time "$server")
+    
+    # NTS test if requested
+    local nts_result nts_status
+    if [ "$CHECK_NTS" = true ]; then
+        nts_result=$(test_nts_support "$server")
+        nts_status=$(echo "$nts_result" | tail -1 | cut -d: -f2)
+    fi
+    
+    # Calculate check duration
+    local end_time
+    end_time=$(date +%s.%N)
+    local check_duration
+    check_duration=$(echo "$end_time - $start_time" | bc -l 2>/dev/null || echo "N/A")
+    
+    # Parse results
+    local dns_status ping_status port_status ntp_status ntp_method
+    dns_status=$(echo "$connectivity_results" | grep -o "DNS:[^[:space:]]*" | cut -d: -f2)
+    ping_status=$(echo "$connectivity_results" | grep -o "PING:[^[:space:]]*" | cut -d: -f2)
+    port_status=$(echo "$connectivity_results" | grep -o "NTP_PORT:[^[:space:]]*" | cut -d: -f2)
+    ntp_status=$(echo "$ntp_result" | cut -d: -f2)
+    ntp_method=$(echo "$ntp_result" | cut -d: -f3)
+    
+    # Display results
+    echo "  DNS Resolution:    $([ "$dns_status" = "OK" ] && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}") $dns_status"
+    echo "  Ping Test:         $([ "$ping_status" = "OK" ] && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}") $ping_status"
+    echo "  NTP Port (123):    $([ "$port_status" = "OK" ] && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}") $port_status"
+    echo "  NTP Response:      $([ "$ntp_status" = "OK" ] && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}") $ntp_status ($ntp_method)"
+    
+    # Show NTS results if requested
+    if [ "$CHECK_NTS" = true ]; then
+        if [ -n "$nts_result" ]; then
+            echo "  NTS Support:"
+            echo "$nts_result" | while read -r nts_line; do
+                local test_name test_result
+                test_name=$(echo "$nts_line" | cut -d: -f1)
+                test_result=$(echo "$nts_line" | cut -d: -f2)
+                case "$test_result" in
+                    "KE_PORT_OK"|"TLS_HANDSHAKE_OK"|"TLS_CERT_OK"|"CHRONY_AVAILABLE"|"CHRONY_NTS_CAPABLE")
+                        echo "    $test_name: $(echo -e "${GREEN}✓${NC}") $test_result"
+                        ;;
+                    "KE_PORT_FAIL"|"TLS_HANDSHAKE_FAIL"|"CHRONY_OLD_VERSION"|"NO_NC_TOOL"|"NO_OPENSSL_TOOL"|"NO_CHRONY_TOOL")
+                        echo "    $test_name: $(echo -e "${RED}✗${NC}") $test_result"
+                        ;;
+                    "CHRONY_VERSION_UNKNOWN")
+                        echo "    $test_name: $(echo -e "${YELLOW}?${NC}") $test_result"
+                        ;;
+                esac
+            done
+        fi
+    fi
+    
+    echo "  Response Time:     $response_time"
+    echo "  Check Duration:    ${check_duration}s"
+    
+    # Overall status
+    if [ "$dns_status" = "OK" ] && [ "$ntp_status" = "OK" ]; then
+        echo -e "  Overall Status:    ${GREEN}HEALTHY${NC}"
+        return 0
+    elif [ "$dns_status" = "OK" ] && [ "$port_status" = "OK" ]; then
+        echo -e "  Overall Status:    ${YELLOW}DEGRADED${NC}"
+        return 1
+    else
+        echo -e "  Overall Status:    ${RED}UNHEALTHY${NC}"
+        return 2
+    fi
+}
+
+# Function to check chrony configured sources
+check_chrony_sources() {
+    echo -e "${BLUE}=== Checking Chrony Configured Sources ===${NC}"
+    echo
+    
+    if ! systemctl is-active --quiet chronyd 2>/dev/null; then
+        echo -e "${YELLOW}Chrony daemon is not running${NC}"
+        return 1
+    fi
+    
+    local sources_output
+    sources_output=$(chronyc sources 2>/dev/null)
+    
+    if [ $? -ne 0 ] || [ -z "$sources_output" ]; then
+        echo -e "${RED}Cannot retrieve chrony sources${NC}"
+        return 1
+    fi
+    
+    echo "Chrony Sources:"
+    echo "$sources_output"
+    echo
+    
+    # Extract server names and check them
+    local servers
+    servers=$(echo "$sources_output" | awk 'NR>3 {print $3}' | grep -v "^$")
+    
+    if [ -z "$servers" ]; then
+        echo -e "${YELLOW}No sources found in chrony configuration${NC}"
+        return 1
+    fi
+    
+    local healthy=0
+    local total=0
+    
+    while IFS= read -r server; do
+        [ -z "$server" ] && continue
+        total=$((total + 1))
+        echo
+        if check_server "$server"; then
+            healthy=$((healthy + 1))
+        fi
+    done <<< "$servers"
+    
+    echo
+    echo -e "${BLUE}Chrony Sources Summary:${NC}"
+    echo "  Total sources: $total"
+    echo "  Healthy sources: $healthy"
+    echo "  Unhealthy sources: $((total - healthy))"
+    
+    if [ "$healthy" -eq "$total" ]; then
+        echo -e "  Overall health: ${GREEN}EXCELLENT${NC}"
+    elif [ "$healthy" -gt 0 ]; then
+        echo -e "  Overall health: ${YELLOW}PARTIAL${NC}"
+    else
+        echo -e "  Overall health: ${RED}CRITICAL${NC}"
+    fi
+}
+
+# Function to generate health report
+generate_health_report() {
+    local servers=("$@")
+    local total=${#servers[@]}
+    local healthy=0
+    local degraded=0
+    local unhealthy=0
+    
+    echo -e "${BLUE}=== NTP Health Report ===${NC}"
+    echo "Generated: $(date)"
+    echo "Total servers checked: $total"
+    echo
+    
+    for server in "${servers[@]}"; do
+        if check_server "$server"; then
+            case $? in
+                0) healthy=$((healthy + 1)) ;;
+                1) degraded=$((degraded + 1)) ;;
+                2) unhealthy=$((unhealthy + 1)) ;;
+            esac
+        else
+            unhealthy=$((unhealthy + 1))
+        fi
+        echo
+    done
+    
+    echo -e "${BLUE}=== Summary ===${NC}"
+    echo "  Healthy servers:    $healthy ($(( healthy * 100 / total ))%)"
+    echo "  Degraded servers:   $degraded ($(( degraded * 100 / total ))%)"
+    echo "  Unhealthy servers:  $unhealthy ($(( unhealthy * 100 / total ))%)"
+    echo
+    
+    if [ "$healthy" -eq "$total" ]; then
+        echo -e "  Overall Assessment: ${GREEN}ALL SYSTEMS OPERATIONAL${NC}"
+        return 0
+    elif [ "$healthy" -gt $(( total / 2 )) ]; then
+        echo -e "  Overall Assessment: ${YELLOW}MOSTLY OPERATIONAL${NC}"
+        return 1
+    else
+        echo -e "  Overall Assessment: ${RED}CRITICAL ISSUES DETECTED${NC}"
+        return 2
+    fi
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -t|--timeout)
+            TIMEOUT="$2"
+            shift 2
+            ;;
+        -a|--all)
+            SERVERS+=("${PUBLIC_SERVERS[@]}")
+            shift
+            ;;
+        -p|--pool)
+            SERVERS+=("${POOL_SERVERS[@]}")
+            shift
+            ;;
+        -l|--list)
+            check_chrony_sources
+            exit $?
+            ;;
+        -f|--file)
+            if [ -f "$2" ]; then
+                while IFS= read -r line; do
+                    [ -n "$line" ] && [[ ! "$line" =~ ^#.*$ ]] && SERVERS+=("$line")
+                done < "$2"
+            else
+                log_message "ERROR" "File not found: $2"
+                exit 1
+            fi
+            shift 2
+            ;;
+        --nts)
+            CHECK_NTS=true
+            shift
+            ;;
+        -*)
+            log_message "ERROR" "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            SERVERS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Check if any servers specified
+if [ ${#SERVERS[@]} -eq 0 ]; then
+    log_message "ERROR" "No servers specified"
+    show_help
+    exit 1
+fi
+
+# Remove duplicate servers
+mapfile -t SERVERS < <(printf '%s\n' "${SERVERS[@]}" | sort -u)
+
+# Main execution
+echo -e "${BLUE}=== NTP Server Health Check Tool ===${NC}"
+echo "Servers to check: ${#SERVERS[@]}"
+echo "Timeout: ${TIMEOUT}s"
+echo
+
+# Validate timeout
+if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || [ "$TIMEOUT" -lt 1 ]; then
+    log_message "ERROR" "Invalid timeout: $TIMEOUT"
+    exit 1
+fi
+
+# Generate the health report
+generate_health_report "${SERVERS[@]}"
+exit_code=$?
+
+echo
+echo -e "${BLUE}Check completed at $(date)${NC}"
+
+exit $exit_code

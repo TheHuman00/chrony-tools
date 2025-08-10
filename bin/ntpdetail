@@ -1,0 +1,288 @@
+#!/bin/bash
+
+# ntpdetail - Get detailed NTP server information including offset, RTT, stratum
+# Part of NTP Tools suite using Chrony
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+# Source the common library
+if [ -f "$LIB_DIR/ntp_common.sh" ]; then
+    source "$LIB_DIR/ntp_common.sh"
+else
+    echo "Error: Cannot find ntp_common.sh library" >&2
+    exit 1
+fi
+
+# Default values
+TIMEOUT=10
+VERBOSE=false
+SERVER=""
+SHOW_ALL=false
+
+# Function to show help
+show_help() {
+    show_usage "ntpdetail" "Get detailed NTP server information including offset, RTT, stratum, and reference ID"
+    echo "Additional Options:"
+    echo "  -s, --server   Specify NTP server (required)"
+    echo "  -a, --all      Show all available information"
+    echo "  --offset       Show only clock offset"
+    echo "  --rtt          Show only round-trip time"
+    echo "  --stratum      Show only stratum level"
+    echo "  --refid        Show only reference ID"
+}
+
+# Function to parse ntpdate output and extract details
+parse_ntpdate_output() {
+    local output="$1"
+    
+    echo -e "${GREEN}=== Detailed NTP Information ===${NC}"
+    echo
+    
+    # Parse ntpdate output
+    while IFS= read -r line; do
+        if [[ "$line" =~ offset ]]; then
+            local offset=$(echo "$line" | sed -n 's/.*offset \([0-9.-]*\).*/\1/p')
+            local delay=$(echo "$line" | sed -n 's/.*delay \([0-9.-]*\).*/\1/p')
+            local dispersion=$(echo "$line" | sed -n 's/.*dispersion \([0-9.-]*\).*/\1/p')
+            
+            echo -e "${BLUE}Clock Offset:${NC} ${offset} seconds"
+            echo -e "${BLUE}Network Delay (RTT):${NC} ${delay} seconds"
+            echo -e "${BLUE}Dispersion:${NC} ${dispersion} seconds"
+            
+            # Convert to milliseconds for better readability
+            if [ -n "$offset" ] && [[ "$offset" =~ ^-?[0-9.]+$ ]]; then
+                local offset_ms=$(echo "$offset * 1000" | bc -l 2>/dev/null || echo "N/A")
+                echo -e "${BLUE}Clock Offset (ms):${NC} ${offset_ms} ms"
+            fi
+            
+            if [ -n "$delay" ] && [[ "$delay" =~ ^-?[0-9.]+$ ]]; then
+                local delay_ms=$(echo "$delay * 1000" | bc -l 2>/dev/null || echo "N/A")
+                echo -e "${BLUE}Network Delay (ms):${NC} ${delay_ms} ms"
+            fi
+        fi
+        
+        if [[ "$line" =~ "stratum" ]]; then
+            local stratum=$(echo "$line" | sed -n 's/.*stratum \([0-9]*\).*/\1/p')
+            echo -e "${BLUE}Stratum Level:${NC} ${stratum}"
+        fi
+    done <<< "$output"
+}
+
+# Function to get detailed server information using multiple methods
+get_server_details() {
+    local server="$1"
+    
+    echo -e "${BLUE}=== NTP Server Analysis: $server ===${NC}"
+    echo
+    
+    # 1. Basic connectivity test
+    echo -e "${GREEN}1. Connectivity Test:${NC}"
+    if host "$server" >/dev/null 2>&1; then
+        local ip=$(host "$server" | grep "has address" | head -1 | awk '{print $4}')
+        echo "   ✓ DNS Resolution: $server → $ip"
+    else
+        echo "   ✗ DNS Resolution failed"
+        return 1
+    fi
+    
+    if timeout 5 nc -u -z "$server" 123 2>/dev/null; then
+        echo "   ✓ NTP Port (123/UDP): Reachable"
+    else
+        echo "   ⚠ NTP Port (123/UDP): May not be reachable"
+    fi
+    echo
+    
+    # 2. Try chronyc if available and running
+    echo -e "${GREEN}2. Chrony Analysis:${NC}"
+    if systemctl is-active --quiet chronyd 2>/dev/null; then
+        echo "   Chrony daemon: Running"
+        
+        # Get sources information
+        local sources_output
+        sources_output=$(timeout "$TIMEOUT" chronyc sources -v 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$sources_output" ]; then
+            echo "   Chrony sources information:"
+            echo "$sources_output" | head -20
+        else
+            echo "   Could not retrieve chrony sources"
+        fi
+        
+        echo
+        
+        # Get tracking information
+        local tracking_output
+        tracking_output=$(timeout "$TIMEOUT" chronyc tracking 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$tracking_output" ]; then
+            echo "   Chrony tracking information:"
+            echo "$tracking_output"
+        fi
+    else
+        echo "   Chrony daemon: Not running"
+    fi
+    echo
+    
+    # 3. Try ntpdate for detailed information
+    echo -e "${GREEN}3. NTP Query (ntpdate):${NC}"
+    if command -v ntpdate >/dev/null 2>&1; then
+        local ntpdate_output
+        ntpdate_output=$(timeout "$TIMEOUT" ntpdate -q "$server" 2>&1)
+        
+        if [ $? -eq 0 ] && [ -n "$ntpdate_output" ]; then
+            parse_ntpdate_output "$ntpdate_output"
+        else
+            echo "   ntpdate query failed or timed out"
+            echo "   Output: $ntpdate_output"
+        fi
+    else
+        echo "   ntpdate not available"
+    fi
+    echo
+    
+    # 4. Try ntpq for additional details
+    echo -e "${GREEN}4. Extended Query (ntpq):${NC}"
+    if command -v ntpq >/dev/null 2>&1; then
+        local ntpq_output
+        ntpq_output=$(timeout "$TIMEOUT" ntpq -p "$server" 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$ntpq_output" ]; then
+            echo "   NTP peers information:"
+            echo "$ntpq_output"
+        else
+            echo "   ntpq query failed or timed out"
+        fi
+    else
+        echo "   ntpq not available"
+    fi
+    echo
+    
+    # 5. Try sntp for simple check
+    echo -e "${GREEN}5. Simple NTP Query (sntp):${NC}"
+    if command -v sntp >/dev/null 2>&1; then
+        local sntp_output
+        sntp_output=$(timeout "$TIMEOUT" sntp -K /dev/null "$server" 2>&1)
+        
+        if [ $? -eq 0 ] && [ -n "$sntp_output" ]; then
+            echo "   SNTP response:"
+            echo "$sntp_output"
+        else
+            echo "   sntp query failed or timed out"
+        fi
+    else
+        echo "   sntp not available"
+    fi
+    echo
+    
+    # 6. Manual packet analysis if nc is available
+    echo -e "${GREEN}6. Manual NTP Packet Analysis:${NC}"
+    if command -v nc >/dev/null 2>&1 && command -v od >/dev/null 2>&1; then
+        # Create NTP request packet
+        local ntp_request
+        ntp_request=$(perl -e 'print "\x1b" . "\x00" x 47' 2>/dev/null || echo -ne '\x1b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00')
+        
+        # Send packet and analyze response
+        local response
+        response=$(echo -n "$ntp_request" | timeout 5 nc -u "$server" 123 2>/dev/null | od -A n -t u1)
+        
+        if [ $? -eq 0 ] && [ -n "$response" ]; then
+            echo "   ✓ NTP packet exchange successful"
+            echo "   Response bytes: $(echo "$response" | wc -w)"
+            
+            # Try to extract basic info from response
+            local response_bytes
+            response_bytes=($(echo "$response"))
+            
+            if [ ${#response_bytes[@]} -ge 48 ]; then
+                local leap_version_mode=${response_bytes[0]}
+                local stratum=${response_bytes[1]}
+                local poll=${response_bytes[2]}
+                local precision=${response_bytes[3]}
+                
+                echo "   Leap/Version/Mode: $leap_version_mode"
+                echo "   Stratum: $stratum"
+                echo "   Poll interval: $poll"
+                echo "   Precision: $precision"
+            fi
+        else
+            echo "   ✗ Manual NTP packet exchange failed"
+        fi
+    else
+        echo "   Required tools (nc, od) not available for manual analysis"
+    fi
+    echo
+    
+    # 7. Summary and recommendations
+    echo -e "${GREEN}7. Summary and Recommendations:${NC}"
+    echo "   Server: $server"
+    echo "   Timestamp: $(date)"
+    
+    if command -v ntpdate >/dev/null 2>&1 || systemctl is-active --quiet chronyd 2>/dev/null; then
+        echo "   Status: NTP tools available for time synchronization"
+    else
+        echo "   Recommendation: Install chrony or ntp package for better functionality"
+    fi
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -t|--timeout)
+            TIMEOUT="$2"
+            shift 2
+            ;;
+        -s|--server)
+            SERVER="$2"
+            shift 2
+            ;;
+        -a|--all)
+            SHOW_ALL=true
+            shift
+            ;;
+        --offset|--rtt|--stratum|--refid)
+            # These could be implemented for specific output filtering
+            shift
+            ;;
+        -*)
+            log_message "ERROR" "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            if [ -z "$SERVER" ]; then
+                SERVER="$1"
+            else
+                log_message "ERROR" "Multiple servers specified. Use one server at a time."
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Check if server is provided
+if [ -z "$SERVER" ]; then
+    log_message "ERROR" "NTP server not specified. Use -s option or provide as argument."
+    show_help
+    exit 1
+fi
+
+# Validate server
+if ! validate_ntp_server "$SERVER"; then
+    exit 1
+fi
+
+# Main execution
+get_server_details "$SERVER"
+
+exit 0

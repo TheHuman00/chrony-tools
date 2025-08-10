@@ -1,0 +1,290 @@
+#!/bin/bash
+
+# monitor - Monitor NTP synchronization status and health
+# Part of NTP Tools suite using Chrony
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+# Source the common library
+if [ -f "$LIB_DIR/ntp_common.sh" ]; then
+    source "$LIB_DIR/ntp_common.sh"
+else
+    echo "Error: Cannot find ntp_common.sh library" >&2
+    exit 1
+fi
+
+# Default values
+CONTINUOUS=false
+INTERVAL=5
+MAX_ITERATIONS=10
+CURRENT_ITERATION=0
+
+# Function to show help
+show_help() {
+    show_usage "monitor" "Monitor NTP synchronization status and health"
+    echo "Additional Options:"
+    echo "  -c, --continuous   Run continuously (Ctrl+C to stop)"
+    echo "  -i, --interval     Monitoring interval in seconds (default: 5)"
+    echo "  -n, --count        Number of iterations (default: 10, ignored with -c)"
+    echo "  --status           Show only sync status"
+    echo "  --sources          Show only time sources"
+}
+
+# Function to check chrony daemon status
+check_chrony_status() {
+    echo -e "${BLUE}=== Chrony Daemon Status ===${NC}"
+    
+    if systemctl is-active --quiet chronyd 2>/dev/null; then
+        echo -e "Service Status: ${GREEN}Running${NC}"
+        
+        # Get service details
+        local service_info
+        service_info=$(systemctl status chronyd 2>/dev/null | head -5)
+        echo "$service_info"
+    else
+        echo -e "Service Status: ${RED}Not Running${NC}"
+        echo "To start chrony: sudo systemctl start chronyd"
+        echo "To enable at boot: sudo systemctl enable chronyd"
+        return 1
+    fi
+    echo
+}
+
+# Function to show time synchronization status
+show_sync_status() {
+    echo -e "${BLUE}=== Time Synchronization Status ===${NC}"
+    
+    if command -v chronyc >/dev/null 2>&1 && systemctl is-active --quiet chronyd 2>/dev/null; then
+        # Get tracking information
+        local tracking_info
+        tracking_info=$(chronyc tracking 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$tracking_info" ]; then
+            echo -e "${GREEN}Chrony Tracking Information:${NC}"
+            echo "$tracking_info"
+            
+            # Extract key metrics
+            local ref_time
+            local system_time
+            local last_offset
+            local rms_offset
+            local stratum
+            
+            ref_time=$(echo "$tracking_info" | grep "Reference time" | awk -F': ' '{print $2}')
+            system_time=$(echo "$tracking_info" | grep "System time" | awk -F': ' '{print $2}')
+            last_offset=$(echo "$tracking_info" | grep "Last offset" | awk -F': ' '{print $2}')
+            rms_offset=$(echo "$tracking_info" | grep "RMS offset" | awk -F': ' '{print $2}')
+            stratum=$(echo "$tracking_info" | grep "Stratum" | awk -F': ' '{print $2}')
+            
+            echo
+            echo -e "${GREEN}Key Metrics Summary:${NC}"
+            [ -n "$stratum" ] && echo "  Stratum Level: $stratum"
+            [ -n "$last_offset" ] && echo "  Last Offset: $last_offset"
+            [ -n "$rms_offset" ] && echo "  RMS Offset: $rms_offset"
+            [ -n "$system_time" ] && echo "  System Time Accuracy: $system_time"
+        else
+            echo -e "${YELLOW}Cannot retrieve chrony tracking information${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Chrony not available, checking alternatives...${NC}"
+        
+        # Check if ntpd is running
+        if systemctl is-active --quiet ntp 2>/dev/null || systemctl is-active --quiet ntpd 2>/dev/null; then
+            echo -e "NTP daemon: ${GREEN}Running${NC}"
+            
+            if command -v ntpq >/dev/null 2>&1; then
+                echo -e "${GREEN}NTP Status (ntpq):${NC}"
+                ntpq -p 2>/dev/null || echo "Failed to query NTP status"
+            fi
+        else
+            echo -e "No NTP daemon detected: ${RED}Not Running${NC}"
+        fi
+    fi
+    
+    echo
+}
+
+# Function to show time sources
+show_time_sources() {
+    echo -e "${BLUE}=== Time Sources ===${NC}"
+    
+    if command -v chronyc >/dev/null 2>&1 && systemctl is-active --quiet chronyd 2>/dev/null; then
+        echo -e "${GREEN}Chrony Sources:${NC}"
+        
+        # Show sources with verbose output
+        local sources_output
+        sources_output=$(chronyc sources -v 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$sources_output" ]; then
+            echo "$sources_output"
+            
+            echo
+            echo -e "${GREEN}Sources Activity:${NC}"
+            chronyc sourcestats 2>/dev/null || echo "Cannot retrieve source statistics"
+        else
+            echo -e "${YELLOW}Cannot retrieve chrony sources${NC}"
+        fi
+    else
+        echo -e "${YELLOW}Chrony not available${NC}"
+        
+        # Try alternative methods
+        if command -v ntpq >/dev/null 2>&1; then
+            echo -e "${GREEN}NTP Peers (ntpq):${NC}"
+            ntpq -p 2>/dev/null || echo "Failed to query NTP peers"
+        fi
+    fi
+    
+    echo
+}
+
+# Function to show system clock information
+show_system_clock() {
+    echo -e "${BLUE}=== System Clock Information ===${NC}"
+    
+    echo -e "${GREEN}Current System Time:${NC}"
+    echo "  Local time: $(date)"
+    echo "  UTC time: $(date -u)"
+    echo "  Timezone: $(date +%Z) ($(date +%z))"
+    
+    echo
+    echo -e "${GREEN}Hardware Clock:${NC}"
+    if command -v hwclock >/dev/null 2>&1; then
+        local hwclock_time
+        hwclock_time=$(hwclock --show 2>/dev/null)
+        if [ $? -eq 0 ]; then
+            echo "  Hardware clock: $hwclock_time"
+        else
+            echo "  Hardware clock: Cannot read (may need sudo)"
+        fi
+    else
+        echo "  hwclock command not available"
+    fi
+    
+    echo
+    echo -e "${GREEN}System Load and Uptime:${NC}"
+    echo "  Uptime: $(uptime)"
+    
+    echo
+}
+
+# Function to run a single monitoring cycle
+run_monitoring_cycle() {
+    local iteration="$1"
+    
+    echo -e "${YELLOW}=== Monitoring Cycle #$iteration ($(date)) ===${NC}"
+    echo
+    
+    # Check chrony status
+    check_chrony_status
+    
+    # Show synchronization status
+    show_sync_status
+    
+    # Show time sources
+    show_time_sources
+    
+    # Show system clock info
+    show_system_clock
+    
+    echo -e "${BLUE}=== End of Cycle #$iteration ===${NC}"
+    echo
+}
+
+# Function to run continuous monitoring
+run_continuous_monitoring() {
+    echo -e "${GREEN}Starting continuous NTP monitoring (Ctrl+C to stop)${NC}"
+    echo "Monitoring interval: ${INTERVAL} seconds"
+    echo
+    
+    local cycle=1
+    while true; do
+        run_monitoring_cycle "$cycle"
+        
+        if [ "$CONTINUOUS" = true ]; then
+            echo -e "${BLUE}Waiting ${INTERVAL} seconds before next cycle...${NC}"
+            sleep "$INTERVAL"
+            cycle=$((cycle + 1))
+        else
+            if [ "$cycle" -ge "$MAX_ITERATIONS" ]; then
+                echo -e "${GREEN}Completed $MAX_ITERATIONS monitoring cycles${NC}"
+                break
+            fi
+            cycle=$((cycle + 1))
+            [ "$cycle" -le "$MAX_ITERATIONS" ] && sleep "$INTERVAL"
+        fi
+    done
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -c|--continuous)
+            CONTINUOUS=true
+            shift
+            ;;
+        -i|--interval)
+            INTERVAL="$2"
+            shift 2
+            ;;
+        -n|--count)
+            MAX_ITERATIONS="$2"
+            shift 2
+            ;;
+        --status)
+            show_sync_status
+            exit 0
+            ;;
+        --sources)
+            show_time_sources
+            exit 0
+            ;;
+        -*)
+            log_message "ERROR" "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            log_message "ERROR" "Unexpected argument: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Validate interval
+if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [ "$INTERVAL" -lt 1 ]; then
+    log_message "ERROR" "Invalid interval: $INTERVAL (must be positive integer)"
+    exit 1
+fi
+
+# Validate max iterations
+if ! [[ "$MAX_ITERATIONS" =~ ^[0-9]+$ ]] || [ "$MAX_ITERATIONS" -lt 1 ]; then
+    log_message "ERROR" "Invalid count: $MAX_ITERATIONS (must be positive integer)"
+    exit 1
+fi
+
+# Main execution
+echo -e "${BLUE}=== NTP Monitoring Tool ===${NC}"
+echo "Configuration:"
+echo "  Continuous mode: $CONTINUOUS"
+echo "  Interval: ${INTERVAL}s"
+[ "$CONTINUOUS" = false ] && echo "  Max cycles: $MAX_ITERATIONS"
+echo
+
+# Set up signal handler for graceful exit
+trap 'echo -e "\n${YELLOW}Monitoring stopped by user${NC}"; exit 0' INT TERM
+
+# Start monitoring
+run_continuous_monitoring
+
+exit 0

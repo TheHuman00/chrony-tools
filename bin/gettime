@@ -1,0 +1,328 @@
+#!/bin/bash
+
+# NTP-Tools: gettime - NTP time retrieval tool
+# Description: Get current time from NTP servers using multiple methods
+
+# Load common functions
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../lib/ntp_common.sh"
+
+# Global variables
+SERVERS=()
+VERBOSE=false
+OUTPUT_FORMAT="human"
+TIMEOUT=5
+
+show_help() {
+    cat << EOF
+Usage: $(basename "$0") [OPTIONS] [SERVER...]
+
+Get current time from NTP servers using multiple fallback methods.
+
+ARGUMENTS:
+    SERVER...            NTP server(s) to query (default: pool.ntp.org)
+
+OPTIONS:
+    -v, --verbose        Verbose output with method used
+    -f, --format FORMAT  Output format: human, iso, unix (default: human)
+    -t, --timeout SEC    Timeout in seconds (default: 5)
+    -h, --help           Show this help message
+
+EXAMPLES:
+    $(basename "$0")                        # Use default NTP pool
+    $(basename "$0") time.google.com        # Query Google NTP
+    $(basename "$0") -v -f iso ntp1.example.com ntp2.example.com
+    $(basename "$0") --timeout 10 pool.ntp.org
+
+OUTPUT FORMATS:
+    human    Human-readable format (default)
+    iso      ISO 8601 format (YYYY-MM-DDTHH:MM:SS+TZ)
+    unix     Unix timestamp
+
+EOF
+}
+
+get_time_chronyc() {
+    local server="$1"
+    
+    if ! command_exists chronyc; then
+        return 1
+    fi
+    
+    local result
+    result=$(timeout "$TIMEOUT" chronyc -n -4 sources 2>/dev/null | grep -E "^\^\*?\s*$server" | head -1)
+    
+    if [ -n "$result" ]; then
+        # Get current time with offset applied
+        local offset_ns
+        offset_ns=$(echo "$result" | awk '{print $9}' | sed 's/[a-z]*$//')
+        
+        if [ -n "$offset_ns" ] && [ "$offset_ns" != "0" ]; then
+            local current_unix
+            current_unix=$(date +%s.%N)
+            
+            # Apply offset (convert from ns to seconds)
+            local offset_sec
+            offset_sec=$(echo "scale=9; $offset_ns / 1000000000" | bc -l 2>/dev/null || echo "0")
+            local corrected_time
+            corrected_time=$(echo "scale=9; $current_unix + $offset_sec" | bc -l 2>/dev/null || echo "$current_unix")
+            
+            echo "$corrected_time"
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+get_time_ntpdate() {
+    local server="$1"
+    
+    if ! command_exists ntpdate; then
+        return 1
+    fi
+    
+    local result
+    result=$(timeout "$TIMEOUT" ntpdate -q -u "$server" 2>/dev/null | tail -1)
+    
+    if [ -n "$result" ] && [[ "$result" =~ [0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+        # Extract date and time from ntpdate output format: "2025-08-10 18:48:34.938421 (+0200) -0.002296 +/- 0.008298 time.google.com..."
+        local date_part time_part
+        date_part=$(echo "$result" | awk '{print $1}')
+        time_part=$(echo "$result" | awk '{print $2}')
+        
+        if [ -n "$date_part" ] && [ -n "$time_part" ]; then
+            # Convert to Unix timestamp
+            local timestamp
+            timestamp=$(date -d "$date_part $time_part" +%s.%N 2>/dev/null)
+            
+            if [ -n "$timestamp" ]; then
+                echo "$timestamp"
+                return 0
+            fi
+        fi
+    fi
+    
+    return 1
+}
+
+get_time_sntp() {
+    local server="$1"
+    
+    if ! command_exists sntp; then
+        return 1
+    fi
+    
+    local result
+    result=$(timeout "$TIMEOUT" sntp -t "$TIMEOUT" "$server" 2>/dev/null)
+    
+    if [ $? -eq 0 ] && [ -n "$result" ]; then
+        # Extract offset from sntp output
+        local offset
+        offset=$(echo "$result" | grep -E "offset|adjust" | head -1 | awk '{print $2}' | tr -d '+')
+        
+        if [ -n "$offset" ]; then
+            local current_unix
+            current_unix=$(date +%s.%N)
+            local corrected_time
+            corrected_time=$(echo "scale=9; $current_unix + $offset" | bc -l 2>/dev/null || echo "$current_unix")
+            
+            echo "$corrected_time"
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+get_time_manual() {
+    local server="$1"
+    local port="${2:-123}"
+    
+    if ! command_exists nc || ! command_exists od; then
+        return 1
+    fi
+    
+    # Create NTP request packet using a different approach
+    local temp_file
+    temp_file=$(mktemp)
+    
+    # Write NTP packet: 48 bytes, first byte 0x1B (LI=0, VN=3, Mode=3)
+    {
+        echo -n -e '\x1b'
+        for i in {1..47}; do
+            echo -n -e '\x00'
+        done
+    } > "$temp_file"
+    
+    # Send packet and get response
+    local response
+    response=$(timeout "$TIMEOUT" nc -u -w "$TIMEOUT" "$server" "$port" < "$temp_file" 2>/dev/null | od -t x1 -A n 2>/dev/null)
+    
+    rm -f "$temp_file"
+    
+    if [ -n "$response" ] && [ ${#response} -gt 100 ]; then
+        # Extract transmit timestamp (bytes 40-47)
+        local hex_bytes
+        hex_bytes=$(echo "$response" | tr -d ' \n' | cut -c241-256 2>/dev/null)
+        
+        if [ ${#hex_bytes} -eq 16 ]; then
+            # Convert hex to decimal (simplified conversion)
+            local high_part low_part
+            high_part=$(echo "ibase=16; ${hex_bytes:0:8}" | bc 2>/dev/null || echo "0")
+            low_part=$(echo "ibase=16; ${hex_bytes:8:8}" | bc 2>/dev/null || echo "0")
+            
+            if [ "$high_part" -gt 0 ]; then
+                # NTP epoch starts at 1900-01-01, Unix epoch at 1970-01-01
+                # Difference is 2208988800 seconds
+                local unix_timestamp
+                unix_timestamp=$(echo "scale=9; $high_part - 2208988800 + $low_part / 4294967296" | bc -l 2>/dev/null)
+                
+                if [ -n "$unix_timestamp" ] && [ "$(echo "$unix_timestamp > 0" | bc)" -eq 1 ]; then
+                    echo "$unix_timestamp"
+                    return 0
+                fi
+            fi
+        fi
+    fi
+    
+    return 1
+}
+
+format_timestamp() {
+    local timestamp="$1"
+    local format="$2"
+    
+    case "$format" in
+        "unix")
+            echo "$timestamp"
+            ;;
+        "iso")
+            date -d "@$timestamp" --iso-8601=seconds 2>/dev/null || echo "Invalid timestamp"
+            ;;
+        "human"|*)
+            date -d "@$timestamp" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "Invalid timestamp"
+            ;;
+    esac
+}
+
+get_time_from_server() {
+    local server="$1"
+    local method_used=""
+    local timestamp=""
+    
+    # Try different methods in order of preference
+    if [ -z "$timestamp" ]; then
+        timestamp=$(get_time_chronyc "$server")
+        if [ $? -eq 0 ] && [ -n "$timestamp" ]; then
+            method_used="chronyc"
+        fi
+    fi
+    
+    if [ -z "$timestamp" ]; then
+        timestamp=$(get_time_ntpdate "$server")
+        if [ $? -eq 0 ] && [ -n "$timestamp" ]; then
+            method_used="ntpdate"
+        fi
+    fi
+    
+    if [ -z "$timestamp" ]; then
+        timestamp=$(get_time_sntp "$server")
+        if [ $? -eq 0 ] && [ -n "$timestamp" ]; then
+            method_used="sntp"
+        fi
+    fi
+    
+    if [ -z "$timestamp" ]; then
+        timestamp=$(get_time_manual "$server")
+        if [ $? -eq 0 ] && [ -n "$timestamp" ]; then
+            method_used="manual"
+        fi
+    fi
+    
+    if [ -n "$timestamp" ]; then
+        local formatted_time
+        formatted_time=$(format_timestamp "$timestamp" "$OUTPUT_FORMAT")
+        
+        if [ "$VERBOSE" = true ]; then
+            echo "$server: $formatted_time (method: $method_used)"
+        else
+            echo "$formatted_time"
+        fi
+        return 0
+    else
+        error "Failed to get time from $server"
+        return 1
+    fi
+}
+
+main() {
+    # Parse arguments
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -f|--format)
+                if [ -z "$2" ]; then
+                    error "Format option requires an argument"
+                    exit 1
+                fi
+                OUTPUT_FORMAT="$2"
+                shift 2
+                ;;
+            -t|--timeout)
+                if [ -z "$2" ]; then
+                    error "Timeout option requires an argument"
+                    exit 1
+                fi
+                TIMEOUT="$2"
+                shift 2
+                ;;
+            -*)
+                error "Unknown option: $1"
+                exit 1
+                ;;
+            *)
+                SERVERS+=("$1")
+                shift
+                ;;
+        esac
+    done
+    
+    # Use default server if none specified
+    if [ ${#SERVERS[@]} -eq 0 ]; then
+        SERVERS=("pool.ntp.org")
+    fi
+    
+    # Validate format
+    case "$OUTPUT_FORMAT" in
+        "human"|"iso"|"unix")
+            ;;
+        *)
+            error "Invalid format: $OUTPUT_FORMAT. Use: human, iso, unix"
+            exit 1
+            ;;
+    esac
+    
+    # Get time from each server
+    local success=false
+    for server in "${SERVERS[@]}"; do
+        if get_time_from_server "$server"; then
+            success=true
+        fi
+    done
+    
+    if [ "$success" = false ]; then
+        error "Failed to get time from any server"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"

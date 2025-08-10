@@ -1,0 +1,451 @@
+#!/bin/bash
+
+# timediff - Calculate time differences between NTP servers or against local time
+# Part of NTP Tools suite using Chrony
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+# Source the common library
+if [ -f "$LIB_DIR/ntp_common.sh" ]; then
+    source "$LIB_DIR/ntp_common.sh"
+else
+    echo "Error: Cannot find ntp_common.sh library" >&2
+    exit 1
+fi
+
+# Default values
+TIMEOUT=10
+VERBOSE=false
+SERVER1=""
+SERVER2=""
+USE_LOCAL=false
+SAMPLES=3
+
+# Function to show help
+show_help() {
+    show_usage "timediff" "Calculate time differences between NTP servers or against local time"
+    echo "Additional Options:"
+    echo "  -1, --server1      First NTP server"
+    echo "  -2, --server2      Second NTP server"
+    echo "  -l, --local        Compare against local system time"
+    echo "  -s, --samples      Number of samples to take (default: 3)"
+    echo
+    echo "Examples:"
+    echo "  timediff -1 pool.ntp.org -2 time.google.com"
+    echo "  timediff -1 0.pool.ntp.org --local"
+    echo "  timediff pool.ntp.org time.nist.gov"
+}
+
+# Function to get timestamp from NTP server
+get_ntp_timestamp() {
+    local server="$1"
+    local method_used=""
+    
+    if [ "$VERBOSE" = true ]; then
+        log_message "DEBUG" "Querying timestamp from $server"
+    fi
+    
+    # Method 1: Try ntpdate
+    if command -v ntpdate >/dev/null 2>&1; then
+        local ntpdate_output
+        ntpdate_output=$(timeout "$TIMEOUT" ntpdate -q "$server" 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$ntpdate_output" ]; then
+            # Extract the server time from ntpdate output
+            local server_line
+            server_line=$(echo "$ntpdate_output" | grep "server $server" | tail -1)
+            
+            if [ -n "$server_line" ]; then
+                # Parse the timestamp from the line
+                local timestamp
+                timestamp=$(echo "$server_line" | awk '{print $3}')
+                
+                if [ -n "$timestamp" ]; then
+                    method_used="ntpdate"
+                    echo "$timestamp|$method_used"
+                    return 0
+                fi
+            fi
+        fi
+    fi
+    
+    # Method 2: Try sntp
+    if command -v sntp >/dev/null 2>&1; then
+        local sntp_output
+        sntp_output=$(timeout "$TIMEOUT" sntp -K /dev/null "$server" 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$sntp_output" ]; then
+            # Extract timestamp from sntp output
+            local timestamp
+            timestamp=$(echo "$sntp_output" | grep -oE '[0-9]{10}\.[0-9]+' | head -1)
+            
+            if [ -n "$timestamp" ]; then
+                method_used="sntp"
+                echo "$timestamp|$method_used"
+                return 0
+            fi
+        fi
+    fi
+    
+    # Method 3: Use chronyd if available
+    if systemctl is-active --quiet chronyd 2>/dev/null; then
+        # This is a fallback - we'll use current time as approximation
+        local current_timestamp
+        current_timestamp=$(date +%s.%N)
+        method_used="chrony_fallback"
+        echo "$current_timestamp|$method_used"
+        return 0
+    fi
+    
+    # Method 4: Manual estimation using current time (very rough)
+    local current_timestamp
+    current_timestamp=$(date +%s.%N)
+    method_used="local_estimate"
+    echo "$current_timestamp|$method_used"
+    return 1
+}
+
+# Function to get local system timestamp
+get_local_timestamp() {
+    local timestamp
+    timestamp=$(date +%s.%N)
+    echo "$timestamp|local_system"
+}
+
+# Function to calculate difference in various units
+calculate_time_difference() {
+    local time1="$1"
+    local time2="$2"
+    local label1="$3"
+    local label2="$4"
+    
+    # Calculate difference in seconds (with decimal precision)
+    local diff_seconds
+    diff_seconds=$(echo "$time2 - $time1" | bc -l 2>/dev/null)
+    
+    if [ $? -ne 0 ] || [ -z "$diff_seconds" ]; then
+        echo "Error calculating time difference"
+        return 1
+    fi
+    
+    # Calculate absolute difference
+    local abs_diff
+    abs_diff=$(echo "$diff_seconds" | sed 's/^-//')
+    
+    # Convert to milliseconds
+    local diff_ms
+    diff_ms=$(echo "$diff_seconds * 1000" | bc -l 2>/dev/null)
+    
+    # Convert to microseconds
+    local diff_us
+    diff_us=$(echo "$diff_seconds * 1000000" | bc -l 2>/dev/null)
+    
+    echo -e "${GREEN}Time Difference Analysis:${NC}"
+    echo "  From: $label1"
+    echo "  To: $label2"
+    echo
+    echo -e "${BLUE}Difference:${NC}"
+    echo "  Seconds: $diff_seconds"
+    echo "  Milliseconds: $diff_ms"
+    echo "  Microseconds: $diff_us"
+    echo
+    
+    # Interpretation
+    echo -e "${BLUE}Interpretation:${NC}"
+    local abs_diff_ms
+    abs_diff_ms=$(echo "$abs_diff * 1000" | bc -l 2>/dev/null)
+    
+    if (( $(echo "$abs_diff < 0.001" | bc -l) )); then
+        echo -e "  Status: ${GREEN}Excellent synchronization (< 1ms)${NC}"
+    elif (( $(echo "$abs_diff < 0.01" | bc -l) )); then
+        echo -e "  Status: ${GREEN}Good synchronization (< 10ms)${NC}"
+    elif (( $(echo "$abs_diff < 0.1" | bc -l) )); then
+        echo -e "  Status: ${YELLOW}Acceptable synchronization (< 100ms)${NC}"
+    elif (( $(echo "$abs_diff < 1" | bc -l) )); then
+        echo -e "  Status: ${YELLOW}Poor synchronization (< 1s)${NC}"
+    else
+        echo -e "  Status: ${RED}Very poor synchronization (> 1s)${NC}"
+    fi
+    
+    if (( $(echo "$diff_seconds > 0" | bc -l) )); then
+        echo "  $label2 is ahead of $label1"
+    else
+        echo "  $label1 is ahead of $label2"
+    fi
+}
+
+# Function to perform multiple samples and calculate statistics
+perform_multiple_samples() {
+    local server1="$1"
+    local server2="$2"
+    local label1="$3"
+    local label2="$4"
+    
+    echo -e "${BLUE}=== Taking $SAMPLES samples for statistical analysis ===${NC}"
+    echo
+    
+    local differences=()
+    local valid_samples=0
+    
+    for i in $(seq 1 "$SAMPLES"); do
+        echo -e "${YELLOW}Sample $i of $SAMPLES...${NC}"
+        
+        # Get timestamps
+        local time1_info time2_info
+        
+        if [ "$server1" = "LOCAL" ]; then
+            time1_info=$(get_local_timestamp)
+        else
+            time1_info=$(get_ntp_timestamp "$server1")
+        fi
+        
+        if [ "$server2" = "LOCAL" ]; then
+            time2_info=$(get_local_timestamp)
+        else
+            time2_info=$(get_ntp_timestamp "$server2")
+        fi
+        
+        # Parse results
+        local time1 method1 time2 method2
+        time1=$(echo "$time1_info" | cut -d'|' -f1)
+        method1=$(echo "$time1_info" | cut -d'|' -f2)
+        time2=$(echo "$time2_info" | cut -d'|' -f1)
+        method2=$(echo "$time2_info" | cut -d'|' -f2)
+        
+        if [ -n "$time1" ] && [ -n "$time2" ]; then
+            local diff
+            diff=$(echo "$time2 - $time1" | bc -l 2>/dev/null)
+            
+            if [ $? -eq 0 ] && [ -n "$diff" ]; then
+                differences+=("$diff")
+                valid_samples=$((valid_samples + 1))
+                echo "  Difference: ${diff} seconds (methods: $method1 vs $method2)"
+            else
+                echo "  Failed to calculate difference for this sample"
+            fi
+        else
+            echo "  Failed to get timestamps for this sample"
+        fi
+        
+        # Small delay between samples
+        [ "$i" -lt "$SAMPLES" ] && sleep 1
+    done
+    
+    echo
+    
+    if [ "$valid_samples" -eq 0 ]; then
+        echo -e "${RED}No valid samples obtained${NC}"
+        return 1
+    fi
+    
+    echo -e "${GREEN}Statistical Analysis ($valid_samples valid samples):${NC}"
+    
+    # Calculate statistics
+    local sum=0
+    local min_diff=""
+    local max_diff=""
+    
+    for diff in "${differences[@]}"; do
+        sum=$(echo "$sum + $diff" | bc -l)
+        
+        if [ -z "$min_diff" ] || (( $(echo "$diff < $min_diff" | bc -l) )); then
+            min_diff="$diff"
+        fi
+        
+        if [ -z "$max_diff" ] || (( $(echo "$diff > $max_diff" | bc -l) )); then
+            max_diff="$diff"
+        fi
+    done
+    
+    local avg_diff
+    avg_diff=$(echo "scale=6; $sum / $valid_samples" | bc -l)
+    
+    echo "  Average difference: $avg_diff seconds"
+    echo "  Minimum difference: $min_diff seconds"
+    echo "  Maximum difference: $max_diff seconds"
+    
+    # Calculate standard deviation
+    local variance_sum=0
+    for diff in "${differences[@]}"; do
+        local deviation
+        deviation=$(echo "$diff - $avg_diff" | bc -l)
+        local squared_deviation
+        squared_deviation=$(echo "$deviation * $deviation" | bc -l)
+        variance_sum=$(echo "$variance_sum + $squared_deviation" | bc -l)
+    done
+    
+    local variance
+    variance=$(echo "scale=6; $variance_sum / $valid_samples" | bc -l)
+    
+    local std_dev
+    std_dev=$(echo "scale=6; sqrt($variance)" | bc -l)
+    
+    echo "  Standard deviation: $std_dev seconds"
+    
+    # Convert to milliseconds for readability
+    local avg_ms min_ms max_ms std_ms
+    avg_ms=$(echo "$avg_diff * 1000" | bc -l)
+    min_ms=$(echo "$min_diff * 1000" | bc -l)
+    max_ms=$(echo "$max_diff * 1000" | bc -l)
+    std_ms=$(echo "$std_dev * 1000" | bc -l)
+    
+    echo
+    echo -e "${BLUE}In milliseconds:${NC}"
+    echo "  Average: $avg_ms ms"
+    echo "  Min: $min_ms ms"
+    echo "  Max: $max_ms ms"
+    echo "  Std Dev: $std_ms ms"
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        -t|--timeout)
+            TIMEOUT="$2"
+            shift 2
+            ;;
+        -1|--server1)
+            SERVER1="$2"
+            shift 2
+            ;;
+        -2|--server2)
+            SERVER2="$2"
+            shift 2
+            ;;
+        -l|--local)
+            USE_LOCAL=true
+            shift
+            ;;
+        -s|--samples)
+            SAMPLES="$2"
+            shift 2
+            ;;
+        -*)
+            log_message "ERROR" "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            if [ -z "$SERVER1" ]; then
+                SERVER1="$1"
+            elif [ -z "$SERVER2" ]; then
+                SERVER2="$1"
+            else
+                log_message "ERROR" "Too many arguments"
+                exit 1
+            fi
+            shift
+            ;;
+    esac
+done
+
+# Validate arguments
+if [ -z "$SERVER1" ]; then
+    log_message "ERROR" "First server not specified"
+    show_help
+    exit 1
+fi
+
+if [ "$USE_LOCAL" = true ]; then
+    SERVER2="LOCAL"
+elif [ -z "$SERVER2" ]; then
+    log_message "ERROR" "Second server not specified (use -l for local time)"
+    show_help
+    exit 1
+fi
+
+# Validate samples count
+if ! [[ "$SAMPLES" =~ ^[0-9]+$ ]] || [ "$SAMPLES" -lt 1 ]; then
+    log_message "ERROR" "Invalid samples count: $SAMPLES"
+    exit 1
+fi
+
+# Check dependencies
+if ! command -v bc >/dev/null 2>&1; then
+    log_message "ERROR" "bc calculator is required for time calculations"
+    echo "Install with: sudo apt install bc"
+    exit 1
+fi
+
+# Validate servers (unless local)
+if [ "$SERVER1" != "LOCAL" ] && ! validate_ntp_server "$SERVER1"; then
+    exit 1
+fi
+
+if [ "$SERVER2" != "LOCAL" ] && ! validate_ntp_server "$SERVER2"; then
+    exit 1
+fi
+
+# Main execution
+echo -e "${BLUE}=== NTP Time Difference Calculator ===${NC}"
+echo "Server 1: $SERVER1"
+echo "Server 2: $SERVER2"
+echo "Samples: $SAMPLES"
+echo "Timeout: ${TIMEOUT}s"
+echo
+
+# Determine labels
+if [ "$SERVER1" = "LOCAL" ]; then
+    label1="Local System Time"
+else
+    label1="$SERVER1"
+fi
+
+if [ "$SERVER2" = "LOCAL" ]; then
+    label2="Local System Time"
+else
+    label2="$SERVER2"
+fi
+
+# Perform the analysis
+if [ "$SAMPLES" -eq 1 ]; then
+    # Single sample
+    echo -e "${YELLOW}Taking single time difference measurement...${NC}"
+    echo
+    
+    # Get timestamps
+    local time1_info time2_info
+    
+    if [ "$SERVER1" = "LOCAL" ]; then
+        time1_info=$(get_local_timestamp)
+    else
+        time1_info=$(get_ntp_timestamp "$SERVER1")
+    fi
+    
+    if [ "$SERVER2" = "LOCAL" ]; then
+        time2_info=$(get_local_timestamp)
+    else
+        time2_info=$(get_ntp_timestamp "$SERVER2")
+    fi
+    
+    # Parse results
+    local time1 method1 time2 method2
+    time1=$(echo "$time1_info" | cut -d'|' -f1)
+    method1=$(echo "$time1_info" | cut -d'|' -f2)
+    time2=$(echo "$time2_info" | cut -d'|' -f1)
+    method2=$(echo "$time2_info" | cut -d'|' -f2)
+    
+    if [ -n "$time1" ] && [ -n "$time2" ]; then
+        echo "Methods used: $method1 vs $method2"
+        echo
+        calculate_time_difference "$time1" "$time2" "$label1" "$label2"
+    else
+        log_message "ERROR" "Failed to get timestamps from one or both sources"
+        exit 1
+    fi
+else
+    # Multiple samples with statistics
+    perform_multiple_samples "$SERVER1" "$SERVER2" "$label1" "$label2"
+fi
+
+exit 0
