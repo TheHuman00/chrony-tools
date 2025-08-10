@@ -1,6 +1,6 @@
 # Chrony Tools
 
-NTP utilities suite for Linux using Chrony (not classic NTP).
+NTP utilities suite for Linux using Chrony
 
 ## 🚀 Quick Install
 
