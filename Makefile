@@ -1,13 +1,13 @@
-# NTP Tools Makefile
+# Chrony Tools Makefile
 
 .PHONY: help install install-user install-system check clean
 
 help:
-@echo "NTP Tools - Available targets:"
-@echo "  install        - Install for current user"
-@echo "  install-system - Install system-wide (requires sudo)"
-@echo "  check          - Check dependencies"
-@echo "  clean          - Clean temporary files"
+	@echo "Chrony Tools - Available targets:"
+	@echo "  install        - Install for current user"
+	@echo "  install-system - Install system-wide (requires sudo)"
+	@echo "  check          - Check dependencies"
+	@echo "  clean          - Clean temporary files"
 
 install: install-user
 

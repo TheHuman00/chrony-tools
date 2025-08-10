@@ -146,24 +146,58 @@ calculate_time_diff() {
     echo "${diff} seconds (${abs_diff}000 ms)"
 }
 
-# Function to show usage information
+# Function to show standard usage information
 show_usage() {
     local script_name="$1"
     local description="$2"
+    local usage_pattern="${3:-"[OPTIONS] [SERVER...]"}"
     
-    echo "Usage: $script_name [OPTIONS] <ntp_server>"
+    echo "Usage: $script_name $usage_pattern"
     echo
     echo "$description"
     echo
-    echo "Options:"
-    echo "  -h, --help     Show this help message"
-    echo "  -v, --verbose  Enable verbose output"
-    echo "  -t, --timeout  Set timeout in seconds (default: 10)"
+    echo "Common Options:"
+    echo "  -h, --help         Show this help message"
+    echo "  -v, --verbose      Enable verbose output"
+    echo "  -t, --timeout SEC  Set timeout in seconds (default: 10)"
     echo
+}
+
+# Function to show standard examples
+show_examples() {
+    local script_name="$1"
+    shift
+    local examples=("$@")
+    
     echo "Examples:"
-    echo "  $script_name pool.ntp.org"
-    echo "  $script_name time.google.com"
-    echo "  $script_name -v 0.pool.ntp.org"
+    for example in "${examples[@]}"; do
+        echo "  $script_name $example"
+    done
+    echo
+}
+
+# Function to parse common arguments
+parse_common_args() {
+    case "$1" in
+        -h|--help)
+            return 1  # Signal to show help
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            return 0
+            ;;
+        -t|--timeout)
+            if [ -z "$2" ]; then
+                error "Timeout option requires an argument"
+                exit 1
+            fi
+            TIMEOUT="$2"
+            return 2  # Signal that 2 arguments were consumed
+            ;;
+        *)
+            return 3  # Not a common argument
+            ;;
+    esac
 }
 
 # Function to log messages with timestamp

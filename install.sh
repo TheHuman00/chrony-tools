@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# install.sh - Installation and setup script for NTP Tools
-# Part of NTP Tools suite using Chrony
+# install.sh - Installation and setup script for Chrony Tools
+# Part of Chrony Tools suite using Chrony
 
 # Colors for output
 RED='\033[0;31m'
@@ -22,7 +22,7 @@ CHECK_DEPS=false
 
 # Function to show help
 show_help() {
-    echo "NTP Tools Installation Script"
+    echo "Chrony Tools Installation Script"
     echo
     echo "Usage: $0 [OPTIONS]"
     echo
@@ -168,7 +168,7 @@ check_chrony_status() {
 install_tools() {
     local target_dir="$1"
     
-    log_message "INFO" "Installing NTP tools to $target_dir"
+    log_message "INFO" "Installing Chrony tools to $target_dir"
     
     # Create target directory if it doesn't exist
     if [ ! -d "$target_dir" ]; then
@@ -184,7 +184,7 @@ install_tools() {
     fi
     
     # Copy tools
-    local tools=("gettime" "ntpdetail" "monitor" "timediff" "ntpcheck")
+    local tools=("chrony-time" "chrony-detail" "chrony-monitor" "chrony-diff" "chrony-check")
     
     for tool in "${tools[@]}"; do
         local src_file="$CURRENT_DIR/bin/$tool"
@@ -214,9 +214,9 @@ install_tools() {
     # Install library
     local lib_target_dir
     if [ "$SYSTEM_INSTALL" = true ]; then
-        lib_target_dir="/usr/local/lib/ntp-tools"
+        lib_target_dir="/usr/local/lib/chrony-tools"
     else
-        lib_target_dir="$HOME/.local/lib/ntp-tools"
+        lib_target_dir="$HOME/.local/lib/chrony-tools"
     fi
     
     log_message "INFO" "Installing library to $lib_target_dir"
@@ -254,7 +254,7 @@ install_tools() {
         fi
     done
     
-    log_message "INFO" "NTP tools installation completed successfully"
+    log_message "INFO" "Chrony tools installation completed successfully"
 }
 
 # Function to update PATH
@@ -289,7 +289,7 @@ run_tests() {
     log_message "INFO" "Running post-installation tests..."
     
     # Test if tools are accessible
-    local tools=("gettime" "ntpdetail" "monitor" "timediff" "ntpcheck")
+    local tools=("chrony-time" "chrony-detail" "chrony-monitor" "chrony-diff" "chrony-check")
     
     for tool in "${tools[@]}"; do
         local tool_path="$bin_dir/$tool"
@@ -302,8 +302,8 @@ run_tests() {
     done
     
     # Test a simple command
-    log_message "INFO" "Testing gettime with help option..."
-    if "$bin_dir/gettime" --help >/dev/null 2>&1; then
+    log_message "INFO" "Testing chrony-time with help option..."
+    if "$bin_dir/chrony-time" --help >/dev/null 2>&1; then
         log_message "INFO" "✓ Tools are working correctly"
     else
         log_message "ERROR" "✗ Tools are not working properly"
@@ -360,7 +360,7 @@ if [ "$SYSTEM_INSTALL" = false ] && [ "$USER_INSTALL" = false ]; then
 fi
 
 # Main installation process
-echo -e "${BLUE}=== NTP Tools Installation Script ===${NC}"
+echo -e "${BLUE}=== Chrony Tools Installation Script ===${NC}"
 echo "Installation mode: $([ "$SYSTEM_INSTALL" = true ] && echo "System-wide" || echo "User")"
 echo "Target directory: $INSTALL_DIR"
 echo "Check dependencies: $CHECK_DEPS"
@@ -368,7 +368,7 @@ echo
 
 # Check if source files exist
 if [ ! -d "$CURRENT_DIR/bin" ] || [ ! -f "$CURRENT_DIR/lib/ntp_common.sh" ]; then
-    log_message "ERROR" "Source files not found. Please run this script from the ntp-tools directory."
+    log_message "ERROR" "Source files not found. Please run this script from the chrony-tools directory."
     exit 1
 fi
 
@@ -414,13 +414,13 @@ echo "1. If this was a user installation, restart your shell or run:"
 echo "   export PATH=\"$INSTALL_DIR:\$PATH\""
 echo
 echo "2. Test the installation:"
-echo "   gettime --help"
-echo "   ntpcheck time.google.com"
+echo "   chrony-time --help"
+echo "   chrony-check time.google.com"
 echo
 echo "3. Start using the tools:"
-echo "   gettime pool.ntp.org"
-echo "   ntpdetail -s time.google.com"
-echo "   monitor --status"
+echo "   chrony-time pool.ntp.org"
+echo "   chrony-detail time.google.com"
+echo "   chrony-monitor --status"
 echo
 
 exit 0

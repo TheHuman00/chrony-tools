@@ -11,42 +11,42 @@ sudo ./install.sh --system # System install
 
 ## 🛠️ Available Tools
 
-### `gettime` - Get NTP time
+### `chrony-time` - Get NTP time
 ```bash
-gettime time.google.com                    # Get time from Google
-gettime -f iso time.cloudflare.com         # ISO format
-gettime -f unix pool.ntp.org               # Unix timestamp
-gettime -v -t 15 time.apple.com            # Verbose, 15s timeout
+chrony-time time.google.com                    # Get time from Google
+chrony-time -f iso time.cloudflare.com         # ISO format
+chrony-time -f unix pool.ntp.org               # Unix timestamp
+chrony-time -v -t 15 time.apple.com            # Verbose, 15s timeout
 ```
 
-### `ntpcheck` - Check NTP servers
+### `chrony-check` - Check NTP servers
 ```bash
-ntpcheck time.google.com                   # Basic check
-ntpcheck --nts time.cloudflare.com         # Check with NTS support
-ntpcheck -a                                # All public servers
-ntpcheck -p                                # NTP pool (0-3.pool.ntp.org)
-ntpcheck server1.com server2.com           # Multiple servers
+chrony-check time.google.com                   # Basic check
+chrony-check --nts time.cloudflare.com         # Check with NTS support
+chrony-check -a                                # All public servers
+chrony-check -p                                # NTP pool (0-3.pool.ntp.org)
+chrony-check server1.com server2.com           # Multiple servers
 ```
 
-### `ntpdetail` - Detailed analysis
+### `chrony-detail` - Detailed analysis
 ```bash
-ntpdetail time.google.com                  # Full analysis
-ntpdetail -s time.cloudflare.com           # Short format
-ntpdetail -v pool.ntp.org                  # Verbose mode
+chrony-detail time.google.com                  # Full analysis
+chrony-detail -s time.cloudflare.com           # Short format
+chrony-detail -v pool.ntp.org                  # Verbose mode
 ```
 
-### `monitor` - System monitoring
+### `chrony-monitor` - System monitoring
 ```bash
-monitor --status                           # Sync status
-monitor --watch                            # Continuous monitoring
-monitor --once                             # Single measurement
+chrony-monitor --status                         # Sync status
+chrony-monitor --watch                          # Continuous monitoring
+chrony-monitor --once                           # Single measurement
 ```
 
-### `timediff` - Time differences
+### `chrony-diff` - Time differences
 ```bash
-timediff --local time.google.com           # Diff with local time
-timediff server1.com server2.com           # Diff between servers
-timediff -n 5 -s time.cloudflare.com       # 5 samples with stats
+chrony-diff --local time.google.com            # Diff with local time
+chrony-diff server1.com server2.com            # Diff between servers
+chrony-diff -n 5 -s time.cloudflare.com        # 5 samples with stats
 ```
 
 ## 📋 Common Options
@@ -61,16 +61,16 @@ timediff -n 5 -s time.cloudflare.com       # 5 samples with stats
 
 ```bash
 # Get current time
-gettime
+chrony-time
 
 # Check NTP server with NTS
-ntpcheck --nts time.cloudflare.com
+chrony-check --nts time.cloudflare.com
 
 # Monitor synchronization
-monitor --status
+chrony-monitor --status
 
 # Compare with local time
-timediff --local pool.ntp.org
+chrony-diff --local pool.ntp.org
 ```
 
 ## Dependencies
